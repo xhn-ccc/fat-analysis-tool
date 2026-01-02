@@ -81,7 +81,7 @@ def calculate_shift_and_match(df_sample, time_col, area_col, std_df, tolerance):
     return results, found_c14, shift
 
 # ==========================================
-# 3. 批量处理逻辑 (新增：处理多样品 Excel)
+# 3. 批量处理逻辑 (处理你的特殊格式文件)
 # ==========================================
 def process_batch_file(df_raw, std_df, tolerance):
     final_results = pd.DataFrame()
@@ -118,21 +118,23 @@ def process_batch_file(df_raw, std_df, tolerance):
         status = f"✅ 偏移 {shift:+.3f}m" if found_c14 else "⚠️ 未找到基准(C14)"
         log_messages.append(f"**{sample_name}**: {status}")
 
-        # 4. 过滤与聚合 (用户要求：去未知，合并同类，算面积)
-        # 去掉 "未知"
+        # 4. 关键步骤：剔除未知 + 合并同类项
+        
+        # (A) 剔除未知
         filtered_df = matched_df[matched_df['Name'] != '未知'].copy()
         
         if filtered_df.empty:
             continue
             
-        # 合并同类项 (Sum Area)
+        # (B) 合并同类项 (Sum Area)
         aggregated = filtered_df.groupby('Name')['Area'].sum().reset_index()
         
-        # 5. 计算百分比
+        # (C) 计算百分比 (可选，如不需要可注释掉下面两行)
         total_area = aggregated['Area'].sum()
         aggregated['Percentage'] = (aggregated['Area'] / total_area) * 100
         
-        # 6. 整理到总表
+        # 5. 整理到总表 (使用 Percentage 或 Area)
+        # 这里默认输出百分比，如果你想要面积数值，把 'Percentage' 改成 'Area' 即可
         sample_series = aggregated.set_index('Name')['Percentage']
         sample_series.name = sample_name
         
@@ -141,11 +143,12 @@ def process_batch_file(df_raw, std_df, tolerance):
         else:
             final_results = final_results.join(sample_series, how='outer')
 
-    # 填充 NaN 为 0，并按标准品顺序排序（可选）
+    # 填充 NaN 为 0
     final_results = final_results.fillna(0)
     
-    # 尝试按标准品列表的顺序排序索引
+    # 按照标准品列表顺序排序索引
     standard_order = std_df['fatty acid'].tolist()
+    # 只保留结果中存在的那些脂肪酸
     final_results = final_results.reindex([x for x in standard_order if x in final_results.index])
     
     return final_results, log_messages
@@ -158,15 +161,17 @@ st.set_page_config(page_title="脂肪酸批量全自动处理", layout="wide")
 
 st.title("🧪 脂肪酸 GC 数据全自动处理")
 st.markdown("""
-**逻辑说明：**
-1. **基准校正**：自动在 12min 左右寻找 **C14:0**，计算时间整体偏移量。
-2. **智能匹配**：基于校正后的时间匹配其他脂肪酸。
-3. **自动清洗**：剔除“未知”峰，合并同名脂肪酸，计算 **百分含量 (%)**。
+**功能说明：**
+1. **自动校正**：基于 C14:0 自动调整保留时间漂移。
+2. **自动清洗**：**直接剔除未知物**。
+3. **自动合并**：同种脂肪酸面积加和。
+4. **结果输出**：输出各脂肪酸的**百分含量**。
 """)
 
 # --- 侧边栏 ---
 with st.sidebar:
     st.header("⚙️ 参数设置")
+    # 容差滑块
     tolerance = st.slider("⏱️ 判定容差 (分钟)", 0.05, 0.5, 0.20, help="即使校正后，时间差距超过此值仍视为未知")
     
     st.markdown("### 📌 标准参考时间")
@@ -186,33 +191,33 @@ if uploaded_file:
         st.dataframe(df_raw.head(3))
         
         if st.button("🚀 开始批量处理", type="primary"):
-            with st.spinner("正在逐个样品进行：C14漂移校正 -> 峰匹配 -> 合并计算..."):
+            with st.spinner("正在进行：C14漂移校正 -> 剔除未知 -> 合并计算..."):
+                
                 # 调用处理函数
                 result_df, logs = process_batch_file(df_raw, edited_std_df, tolerance)
             
             # 显示校正日志
-            with st.expander("查看每个样品的校正情况 (C14检测结果)"):
+            with st.expander("查看每个样品的 C14 校正情况"):
                 st.markdown("  \n".join(logs))
             
-            st.success("处理完成！结果如下（单位：%）")
+            st.success("处理完成！所有未知数据已剔除，同类项已合并。")
             
             # 显示结果
-            st.write("### 2. 最终结果 (百分含量)")
+            st.write("### 2. 最终结果 (百分含量 %)")
             st.dataframe(result_df.style.format("{:.2f}"), use_container_width=True)
             
             # 下载按钮
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 result_df.to_excel(writer, sheet_name='Percentage_Result')
-                # 也可以把原始面积放进去，如果需要的话
             
             st.download_button(
                 label="📥 下载最终结果 Excel",
                 data=output.getvalue(),
-                file_name="脂肪酸分析结果_百分比.xlsx",
+                file_name="脂肪酸分析结果_已剔除未知.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
     except Exception as e:
         st.error(f"文件处理出错: {e}")
-        st.warning("请确保上传的文件是 Excel 格式，且排版为：第一行样品名，下面是 Time/Area 两列一组。")
+        st.warning("请确保上传的文件格式正确：第一行为样品名，第二行为 Time/Area，后续为数据。")
