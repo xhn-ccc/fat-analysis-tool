@@ -1,189 +1,150 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import io
-import zipfile
 
 
 # ==========================================
-# 核心处理逻辑 (从你的脚本重构)
+# 1. 核心数据：内置的标准品出峰时间表
 # ==========================================
-
-def process_single_dataframe(sample_df, filename, ref_df, window_size=0.15, base_fa='C14:0'):
+def get_standard_data():
     """
-    处理单个 DataFrame 数据
+    直接返回固定的标准品数据，无需用户上传
     """
-    # 标准化列名（防止大小写问题）
-    sample_df.columns = [c.lower() for c in sample_df.columns]
-
-    # 检查必要列
-    if 'rt' not in sample_df.columns or 'area' not in sample_df.columns:
-        return None, f"文件 {filename} 缺少 'rt' 或 'area' 列"
-
-    # 数据类型转换
-    sample_df['rt'] = pd.to_numeric(sample_df['rt'], errors='coerce')
-    sample_df['area'] = pd.to_numeric(sample_df['area'], errors='coerce')
-    sample_df = sample_df.fillna(0)
-
-    # 1. 寻找基准脂肪酸 (Base Fatty Acid)
-    ref_base = ref_df[ref_df['fatty_acid'] == base_fa]
-    if ref_base.empty:
-        return None, f"参考表中未找到基准脂肪酸: {base_fa}"
-
-    rt_ref_base = float(ref_base['rt_ref'].iloc[0])
-
-    # 在样本中找最接近 rt_ref_base 的峰
-    if sample_df.empty:
-        return None, f"文件 {filename} 内容为空"
-
-    idx_base = (sample_df['rt'] - rt_ref_base).abs().idxmin()
-    rt_act_base = float(sample_df.loc[idx_base, 'rt'])
-    delta = rt_act_base - rt_ref_base
-
-    # 2. 逐个匹配
-    results = []
-    for _, r in ref_df.iterrows():
-        fa = r['fatty_acid']
-        rt_ref = float(r['rt_ref'])
-        center = rt_ref + delta
-
-        # 找 window_size 范围内的所有峰
-        df_win = sample_df[np.abs(sample_df['rt'] - center) <= window_size]
-
-        if df_win.empty:
-            area_sum = np.nan
-            rt_act = np.nan
-        else:
-            area_sum = float(df_win['area'].sum())
-            idx_best = (df_win['rt'] - center).abs().idxmin()
-            rt_act = float(sample_df.loc[idx_best, 'rt'])
-
-        results.append({
-            'fatty_acid': fa,
-            'rt_ref': rt_ref,
-            'rt_actual': rt_act,
-            'area_sum': area_sum
-        })
-
-    return pd.DataFrame(results), None
+    data = {
+        'fatty acid': [
+            'C14:0', 'C14:1', 'C16:0', 'C16:1', 'C18:0',
+            'C18:1n-9', 'C18:1n-7', 'C18:2n-6(LA)', 'C18:3n-3(ALA)',
+            'C18:4n-3', 'C20:0', 'C20:1n-9', 'C20:3n-3 ',
+            'C20:2n-6', 'C20:4n-3', 'C20:4n-6（ARA）', 'C20:5n-3  (EPA)',
+            'C22:1n-11', 'C22:5n-3(DPA)', 'C22:6n-3(DHA)'
+        ],
+        'std_time': [
+            11.972, 12.299, 14.611, 14.787, 16.261,
+            17.251, 17.750, 18.400, 19.193, 20.675,
+            21.056, 21.644, 22.668, 22.726, 23.544,
+            23.811, 24.347, 26.737, 30.662, 31.955
+        ]
+    }
+    return pd.DataFrame(data)
 
 
 # ==========================================
-# Streamlit 界面代码
+# 2. 核心逻辑：根据时间匹配名字
 # ==========================================
+def match_peak_name(sample_time, std_df, tolerance=0.2):
+    """
+    sample_time: 待测样品的出峰时间
+    std_df: 标准品数据表
+    tolerance: 时间误差窗口（分钟），默认 ±0.2 分钟
+    """
+    # 计算待测时间与所有标准时间的差值的绝对值
+    std_df['diff'] = (std_df['std_time'] - sample_time).abs()
 
-st.set_page_config(page_title="气相色谱脂肪酸匹配工具", layout="wide")
+    # 找到差异最小的那一行
+    closest_match = std_df.loc[std_df['diff'].idxmin()]
 
-st.title("⚗️ 气相色谱脂肪酸数据自动筛选工具")
-st.markdown("""
-上传 **标准参考表 (ref.csv)** 和 **气相色谱原始数据**，系统将自动根据保留时间(RT)进行峰匹配和面积积分。
-""")
-
-# --- 侧边栏配置 ---
-st.sidebar.header("⚙️ 参数设置")
-window_size = st.sidebar.number_input("匹配窗口大小 (min)", min_value=0.01, value=0.15, step=0.01, format="%.2f")
-base_fa = st.sidebar.text_input("基准脂肪酸名称 (用于校正偏移)", value="C14:0")
-
-st.sidebar.markdown("---")
-st.sidebar.info("说明：系统会根据基准脂肪酸计算整体时间偏移量，然后在固定窗口内寻找对应峰并计算面积总和。")
-
-# --- 文件上传 ---
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("1. 上传参考表")
-    ref_file = st.file_uploader("上传 ref.csv (包含 fatty_acid, rt_ref)", type=['csv'])
-
-with col2:
-    st.subheader("2. 上传样本数据")
-    sample_files = st.file_uploader("上传样本文件 (.xlsx, .xls, .csv)", type=['xlsx', 'xls', 'csv'],
-                                    accept_multiple_files=True)
-
-# --- 处理逻辑 ---
-if st.button("🚀 开始处理", type="primary"):
-    if not ref_file:
-        st.error("❌ 请先上传参考表 (ref.csv)")
-    elif not sample_files:
-        st.error("❌ 请至少上传一个样本文件")
+    # 如果差异小于设定的容差，就认为匹配成功
+    if closest_match['diff'] <= tolerance:
+        return closest_match['fatty acid']
     else:
-        # 读取参考表
-        try:
-            ref_df = pd.read_csv(ref_file)
-            # 简单的列名检查
-            if 'fatty_acid' not in ref_df.columns or 'rt_ref' not in ref_df.columns:
-                st.error("❌ ref.csv 格式错误：必须包含 'fatty_acid' 和 'rt_ref' 列")
-                st.stop()
-        except Exception as e:
-            st.error(f"❌ 读取参考表失败: {e}")
-            st.stop()
+        return "未知/未匹配"
 
-        # 准备结果容器
-        processed_files = []
-        logs = []
-        progress_bar = st.progress(0)
 
-        # 内存中的 ZIP 文件
-        zip_buffer = io.BytesIO()
+# ==========================================
+# 3. Streamlit 页面布局
+# ==========================================
 
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            for i, uploaded_file in enumerate(sample_files):
-                # 更新进度条
-                progress_bar.progress((i + 1) / len(sample_files))
+st.set_page_config(page_title="脂肪酸自动识别工具", layout="wide")
 
-                filename = uploaded_file.name
-                ext = filename.split('.')[-1].lower()
+st.title("🧪 脂肪酸峰自动识别工具 (内置标准版)")
 
-                try:
-                    # 读取样本文件
-                    if ext == 'csv':
-                        sample_df = pd.read_csv(uploaded_file)
-                    else:
-                        sample_df = pd.read_excel(uploaded_file)
+# --- 侧边栏：设置与参考 ---
+with st.sidebar:
+    st.header("⚙️ 参数设置")
 
-                    # 处理数据
-                    result_df, error_msg = process_single_dataframe(
-                        sample_df, filename, ref_df,
-                        window_size=window_size, base_fa=base_fa
-                    )
+    # 容差设置：很重要，因为机器每次跑可能会有微小的时间漂移
+    tolerance = st.slider(
+        "⏱️ 匹配时间窗口 (分钟)",
+        min_value=0.01,
+        max_value=1.0,
+        value=0.3,
+        step=0.01,
+        help="如果待测样品的出峰时间在 标准时间 ± 这个数值 范围内，则判定匹配成功。"
+    )
 
-                    if error_msg:
-                        logs.append(f"⚠️ {filename}: {error_msg}")
-                    else:
-                        logs.append(f"✅ {filename}: 处理成功")
-                        # 将结果写入 ZIP
-                        csv_buffer = result_df.to_csv(index=False, encoding='utf_8_sig')
-                        zip_file.writestr(f"matched_{filename.rsplit('.', 1)[0]}.csv", csv_buffer)
+    st.divider()
 
-                        # 仅展示第一个文件的结果作为预览
-                        if len(processed_files) == 0:
-                            preview_df = result_df
-                            preview_name = filename
+    st.markdown("### 📌 当前内置标准参考")
+    std_df = get_standard_data()
+    st.dataframe(std_df, hide_index=True, use_container_width=True)
 
-                        processed_files.append(filename)
+# --- 主区域：上传待测样品 ---
+st.info(f"💡 说明：无需上传标准表，只需上传待测样品数据。当前匹配时间容差为：±{tolerance} 分钟")
 
-                except Exception as e:
-                    logs.append(f"❌ {filename}: 处理异常 - {str(e)}")
+uploaded_file = st.file_uploader("📂 请上传待测样品数据 (Excel 或 CSV)", type=['xlsx', 'xls', 'csv'])
 
-        # --- 结果展示 ---
-        st.success(f"处理完成！成功处理 {len(processed_files)} / {len(sample_files)} 个文件。")
+if uploaded_file:
+    try:
+        # 读取文件
+        if uploaded_file.name.endswith('.csv'):
+            df_sample = pd.read_csv(uploaded_file)
+        else:
+            df_sample = pd.read_excel(uploaded_file)
 
-        # 显示日志
-        with st.expander("查看处理日志"):
-            for log in logs:
-                st.text(log)
+        st.write("### 1. 数据预览 (前5行)")
+        st.dataframe(df_sample.head())
 
-        # 如果有成功的文件，提供下载和预览
-        if processed_files:
-            st.markdown("---")
-            st.subheader("3. 结果预览与下载")
+        # --- 让用户选择列名 (防止用户上传的文件列名不一样) ---
+        col1, col2 = st.columns(2)
+        with col1:
+            time_col = st.selectbox("请选择代表【保留时间/Time】的列：", df_sample.columns)
+        with col2:
+            # 如果有峰面积列，也可以选上，方便后续展示
+            area_col = st.selectbox("请选择代表【峰面积/Area】的列 (可选)：", [None] + list(df_sample.columns))
 
-            # 下载按钮
-            st.download_button(
-                label="📥 下载所有结果 (.zip)",
-                data=zip_buffer.getvalue(),
-                file_name="fatty_acid_results.zip",
-                mime="application/zip"
+        if st.button("🚀 开始匹配识别", type="primary"):
+            # 执行匹配
+            results = df_sample.copy()
+
+            # 使用 apply 函数应用匹配逻辑
+            results['匹配结果 (Fatty Acid)'] = results[time_col].apply(
+                lambda x: match_peak_name(x, std_df.copy(), tolerance)
             )
 
-            st.write(f"**预览 ({preview_name}):**")
-            st.dataframe(preview_df.style.format({"rt_ref": "{:.3f}", "rt_actual": "{:.3f}", "area_sum": "{:.1f}"}))
+            # 整理显示列的顺序
+            cols_to_show = [time_col, '匹配结果 (Fatty Acid)']
+            if area_col:
+                cols_to_show.append(area_col)
+            # 把剩下的列也放后面
+            remaining_cols = [c for c in results.columns if c not in cols_to_show]
+            final_cols = cols_to_show + remaining_cols
+
+            results = results[final_cols]
+
+            st.success("✅ 匹配完成！")
+
+            # --- 展示结果 ---
+            st.write("### 2. 识别结果")
+
+
+            # 高亮显示“未知”的数据，方便检查
+            def highlight_unknown(val):
+                color = 'salmon' if val == "未知/未匹配" else 'lightgreen'
+                return f'background-color: {color}'
+
+
+            st.dataframe(
+                results.style.map(highlight_unknown, subset=['匹配结果 (Fatty Acid)']),
+                use_container_width=True
+            )
+
+            # --- 下载按钮 ---
+            csv = results.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 下载处理后的结果 (CSV)",
+                data=csv,
+                file_name=f"识别结果_{uploaded_file.name}.csv",
+                mime='text/csv',
+            )
+
+    except Exception as e:
+        st.error(f"❌ 读取文件出错，请检查文件格式: {e}")
