@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import io
 
 # ==========================================
 # 1. 核心数据：内置的标准品出峰时间表
@@ -24,7 +23,50 @@ def get_standard_data():
     return pd.DataFrame(data)
 
 # ==========================================
-# 2. 核心算法：基准峰校正匹配 (保留你提供的逻辑)
+# 2. 核心逻辑：智能读取文件 (带表头探测)
+# ==========================================
+def load_data_smart(uploaded_file):
+    try:
+        # A. 初步读取前10行
+        if uploaded_file.name.endswith('.csv'):
+            try:
+                df_temp = pd.read_csv(uploaded_file, header=None, nrows=10)
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                df_temp = pd.read_csv(uploaded_file, header=None, nrows=10, encoding='gbk')
+        else:
+            df_temp = pd.read_excel(uploaded_file, header=None, nrows=10)
+        
+        # B. 寻找表头
+        best_header_idx = 0
+        max_matches = 0
+        keywords = ['时间', 'Time', 'time', '面积', 'Area', 'area']
+        
+        for i in range(min(5, len(df_temp))):
+            row_str = " ".join(df_temp.iloc[i].astype(str).tolist())
+            matches = sum(1 for k in keywords if k in row_str)
+            if matches > max_matches:
+                max_matches = matches
+                best_header_idx = i
+        
+        # C. 重新读取
+        uploaded_file.seek(0)
+        if uploaded_file.name.endswith('.csv'):
+            try:
+                df = pd.read_csv(uploaded_file, header=best_header_idx)
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, header=best_header_idx, encoding='gbk')
+        else:
+            df = pd.read_excel(uploaded_file, header=best_header_idx)
+            
+        return df, best_header_idx
+
+    except Exception as e:
+        return None, str(e)
+
+# ==========================================
+# 3. 新核心算法：基准峰校正匹配
 # ==========================================
 def calculate_shift_and_match(df_sample, time_col, area_col, std_df, tolerance):
     """
@@ -38,9 +80,11 @@ def calculate_shift_and_match(df_sample, time_col, area_col, std_df, tolerance):
     # C14的标准时间
     c14_std_time = std_df[std_df['fatty acid'] == 'C14:0']['std_time'].values[0]
     
-    # 在标准时间 ± 1.5 分钟范围内寻找
+    # 在标准时间 ± 1.0 分钟范围内寻找
+    # 这里范围可以大一点，因为我们还要看面积最大
     search_window = 1.5 
     
+    # 筛选出在 C14 附近的峰
     candidates = df_sample[
         (df_sample[time_col] >= c14_std_time - search_window) & 
         (df_sample[time_col] <= c14_std_time + search_window)
@@ -48,176 +92,145 @@ def calculate_shift_and_match(df_sample, time_col, area_col, std_df, tolerance):
     
     shift = 0.0
     found_c14 = False
+    c14_actual_time = 0.0
     
     if not candidates.empty:
-        # 找面积最大的作为 C14:0
+        # 如果指定了面积列，找面积最大的；否则找时间最近的
         if area_col and area_col in df_sample.columns:
+            # 按面积降序排列，取第一个
             best_c14 = candidates.sort_values(by=area_col, ascending=False).iloc[0]
         else:
+            # 没选面积列，只能找时间最接近的（风险较大，但作为兜底）
             candidates['temp_diff'] = (candidates[time_col] - c14_std_time).abs()
             best_c14 = candidates.sort_values(by='temp_diff').iloc[0]
             
         c14_actual_time = best_c14[time_col]
-        shift = c14_actual_time - c14_std_time # 计算偏移量
+        shift = c14_actual_time - c14_std_time # 计算偏移量 (正数代表整体偏晚)
         found_c14 = True
     
     # --- Step 2: 定义单行匹配函数 ---
     def match_row(row_time):
+        # 如果没找到基准，shift就是0，相当于回退到原始匹配
+        # 校正后的标准时间 = 原始标准 + 偏移量
+        # 我们要找一个标准脂肪酸，使得 (std_time + shift) 与 row_time 最接近
+        
         current_std = std_df.copy()
-        # 核心：标准时间 + 偏移量 = 理论当前时间
         current_std['calibrated_time'] = current_std['std_time'] + shift
         current_std['diff'] = (current_std['calibrated_time'] - row_time).abs()
         
+        # 找差异最小的
         closest = current_std.loc[current_std['diff'].idxmin()]
         
         if closest['diff'] <= tolerance:
-            return closest['fatty acid']
+            return closest['fatty acid'], closest['diff']
         else:
-            return "未知"
+            return "未知", closest['diff']
 
     # --- Step 3: 应用匹配 ---
-    results['Name'] = results[time_col].apply(match_row)
+    matched_names = []
+    diffs = []
     
-    return results, found_c14, shift
-
-# ==========================================
-# 3. 批量处理逻辑 (处理你的特殊格式文件)
-# ==========================================
-def process_batch_file(df_raw, std_df, tolerance):
-    final_results = pd.DataFrame()
-    log_messages = []
-
-    # 遍历每两列 (假设格式: SampleName -> Time/Area -> Data)
-    for i in range(0, df_raw.shape[1], 2):
-        if i + 1 >= df_raw.shape[1]:
-            break
-            
-        # 1. 获取样品名称 (Row 0)
-        sample_name = df_raw.iloc[0, i]
-        if pd.isna(sample_name):
-            sample_name = f"Sample_{i//2 + 1}"
+    for t in df_sample[time_col]:
+        name, diff = match_row(t)
+        matched_names.append(name)
+        diffs.append(diff)
         
-        # 2. 提取数据 (Row 2+)
-        sub_df = df_raw.iloc[2:, i:i+2].copy()
-        sub_df.columns = ['Time', 'Area']
-        
-        # 清洗数据
-        sub_df['Time'] = pd.to_numeric(sub_df['Time'], errors='coerce')
-        sub_df['Area'] = pd.to_numeric(sub_df['Area'], errors='coerce')
-        sub_df = sub_df.dropna(subset=['Time', 'Area'])
-        
-        if sub_df.empty:
-            continue
-
-        # 3. 调用核心算法进行识别 (带漂移校正)
-        matched_df, found_c14, shift = calculate_shift_and_match(
-            sub_df, 'Time', 'Area', std_df, tolerance
-        )
-        
-        # 记录日志
-        status = f"✅ 偏移 {shift:+.3f}m" if found_c14 else "⚠️ 未找到基准(C14)"
-        log_messages.append(f"**{sample_name}**: {status}")
-
-        # 4. 关键步骤：剔除未知 + 合并同类项
-        
-        # (A) 剔除未知
-        filtered_df = matched_df[matched_df['Name'] != '未知'].copy()
-        
-        if filtered_df.empty:
-            continue
-            
-        # (B) 合并同类项 (Sum Area)
-        aggregated = filtered_df.groupby('Name')['Area'].sum().reset_index()
-        
-        # (C) 计算百分比 (可选，如不需要可注释掉下面两行)
-        total_area = aggregated['Area'].sum()
-        aggregated['Percentage'] = (aggregated['Area'] / total_area) * 100
-        
-        # 5. 整理到总表 (使用 Percentage 或 Area)
-        # 这里默认输出百分比，如果你想要面积数值，把 'Percentage' 改成 'Area' 即可
-        sample_series = aggregated.set_index('Name')['Percentage']
-        sample_series.name = sample_name
-        
-        if final_results.empty:
-            final_results = pd.DataFrame(sample_series)
-        else:
-            final_results = final_results.join(sample_series, how='outer')
-
-    # 填充 NaN 为 0
-    final_results = final_results.fillna(0)
+    results['匹配结果'] = matched_names
+    # results['偏差值'] = diffs # 调试用，可以注释掉
     
-    # 按照标准品列表顺序排序索引
-    standard_order = std_df['fatty acid'].tolist()
-    # 只保留结果中存在的那些脂肪酸
-    final_results = final_results.reindex([x for x in standard_order if x in final_results.index])
-    
-    return final_results, log_messages
+    return results, found_c14, shift, c14_actual_time
 
 # ==========================================
 # 4. Streamlit 界面
 # ==========================================
 
-st.set_page_config(page_title="脂肪酸批量全自动处理", layout="wide")
+st.set_page_config(page_title="脂肪酸智能校正工具", layout="wide")
 
-st.title("🧪 脂肪酸 GC 数据全自动处理")
-st.markdown("""
-**功能说明：**
-1. **自动校正**：基于 C14:0 自动调整保留时间漂移。
-2. **自动清洗**：**直接剔除未知物**。
-3. **自动合并**：同种脂肪酸面积加和。
-4. **结果输出**：输出各脂肪酸的**百分含量**。
-""")
+st.title("🧪 脂肪酸自动识别 (基准峰校正版)")
+st.caption("逻辑升级：自动寻找 C14:0 最高峰作为基准，计算整体时间漂移，再匹配其他物质。")
 
 # --- 侧边栏 ---
 with st.sidebar:
     st.header("⚙️ 参数设置")
-    # 容差滑块
-    tolerance = st.slider("⏱️ 判定容差 (分钟)", 0.05, 0.5, 0.20, help="即使校正后，时间差距超过此值仍视为未知")
-    
-    st.markdown("### 📌 标准参考时间")
-    # 允许用户在界面上微调标准时间
-    std_df_original = get_standard_data()
-    edited_std_df = st.data_editor(std_df_original, num_rows="dynamic", use_container_width=True)
+    tolerance = st.slider("⏱️ 判定容差 (分钟)", 0.05, 0.5, 0.2, 0.01, help="即使经过校正，如果差距还是超过这个值，则判为未知")
+    st.divider()
+    st.markdown("### 📌 标准参考 (未校正)")
+    std_df = get_standard_data()
+    st.dataframe(std_df, hide_index=True, use_container_width=True)
 
 # --- 主区域 ---
-uploaded_file = st.file_uploader("📂 上传 Excel 文件 (多样品格式)", type=['xlsx', 'xls'])
+uploaded_file = st.file_uploader("📂 请上传待测样品数据", type=['xlsx', 'xls', 'csv'])
 
 if uploaded_file:
-    # 直接读取，header=None 方便我们处理第一行的样品名
-    try:
-        df_raw = pd.read_excel(uploaded_file, header=None)
+    df_sample, msg = load_data_smart(uploaded_file)
+    
+    if df_sample is None:
+        st.error(f"读取失败: {msg}")
+    else:
+        st.write("### 1. 数据预览")
+        st.dataframe(df_sample.head())
         
-        st.write("### 1. 原始数据预览")
-        st.dataframe(df_raw.head(3))
+        # 列选择
+        valid_cols = [c for c in df_sample.columns if "Unnamed" not in str(c)]
         
-        if st.button("🚀 开始批量处理", type="primary"):
-            with st.spinner("正在进行：C14漂移校正 -> 剔除未知 -> 合并计算..."):
-                
-                # 调用处理函数
-                result_df, logs = process_batch_file(df_raw, edited_std_df, tolerance)
-            
-            # 显示校正日志
-            with st.expander("查看每个样品的 C14 校正情况"):
-                st.markdown("  \n".join(logs))
-            
-            st.success("处理完成！所有未知数据已剔除，同类项已合并。")
-            
-            # 显示结果
-            st.write("### 2. 最终结果 (百分含量 %)")
-            st.dataframe(result_df.style.format("{:.2f}"), use_container_width=True)
-            
-            # 下载按钮
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                result_df.to_excel(writer, sheet_name='Percentage_Result')
-            
-            st.download_button(
-                label="📥 下载最终结果 Excel",
-                data=output.getvalue(),
-                file_name="脂肪酸分析结果_已剔除未知.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        c1, c2 = st.columns(2)
+        # 智能选时间列
+        t_idx = next((i for i, c in enumerate(valid_cols) if "时间" in str(c) or "Time" in str(c)), 0)
+        time_col = c1.selectbox("【保留时间】列 (必选)", valid_cols, index=t_idx)
+        
+        # 智能选面积列 (现在是找基准峰的关键)
+        a_idx = next((i for i, c in enumerate(valid_cols) if "面积" in str(c) or "Area" in str(c)), 0)
+        area_col = c2.selectbox("【峰面积】列 (强烈建议选)", [None]+valid_cols, index=a_idx+1 if a_idx is not None else 0)
 
-    except Exception as e:
-        st.error(f"文件处理出错: {e}")
-        st.warning("请确保上传的文件格式正确：第一行为样品名，第二行为 Time/Area，后续为数据。")
+        if st.button("🚀 开始校正并识别", type="primary"):
+            # 数据清洗
+            work_df = df_sample.copy()
+            work_df[time_col] = pd.to_numeric(work_df[time_col], errors='coerce')
+            if area_col:
+                work_df[area_col] = pd.to_numeric(work_df[area_col], errors='coerce')
+            work_df = work_df.dropna(subset=[time_col])
+            
+            # === 调用新逻辑 ===
+            final_df, found_c14, shift, c14_time = calculate_shift_and_match(
+                work_df, time_col, area_col, std_df, tolerance
+            )
+            
+            # === 结果反馈区 ===
+            st.divider()
+            st.write("### 2. 校正报告")
+            
+            res_col1, res_col2, res_col3 = st.columns(3)
+            if found_c14:
+                res_col1.metric("基准峰 (C14:0)", "✅ 已定位")
+                res_col2.metric("基准实际出峰", f"{c14_time:.3f} min")
+                
+                # 根据偏移量显示不同颜色
+                shift_display = f"{shift:+.3f} min"
+                res_col3.metric("系统整体偏移", shift_display, delta_color="inverse")
+                
+                st.info(f"💡 分析：检测到 C14:0 实际出峰比标准偏了 **{shift:.3f} 分钟**。系统已自动将所有标准参考时间调整了此数值，然后进行最近匹配。")
+            else:
+                res_col1.metric("基准峰 (C14:0)", "❌ 未找到")
+                st.warning("⚠️ 警告：在 11.972 ± 1.5 min 范围内未找到有效的 C14:0 峰（或未选择面积列导致无法判断最高峰）。系统将使用 **原始标准时间** 进行强制匹配，准确率可能下降。")
+            
+            # === 展示结果 ===
+            st.write("### 3. 详细识别表")
+            
+            # 整理列顺序
+            cols = [time_col, '匹配结果']
+            if area_col: cols.append(area_col)
+            
+            # 样式
+            def highlight(val):
+                if val == "C14:0": return 'background-color: lightblue; font-weight: bold' # 基准峰标蓝
+                if val == "未知": return 'color: gray'
+                return 'background-color: lightgreen'
+
+            st.dataframe(
+                final_df[cols].style.map(highlight, subset=['匹配结果']), 
+                use_container_width=True
+            )
+            
+            # 下载
+            out_csv = final_df[cols].to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 下载校正后的结果", out_csv, f"校正结果_{uploaded_file.name}.csv", "text/csv")
